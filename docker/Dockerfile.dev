@@ -1,0 +1,286 @@
+# aoe-slim-dev: aoe-slim plus the dev toolchain.
+#
+# Includes: Go, uv (Python), Playwright (+ Chromium), Caddy, gh (GitHub CLI),
+# logseq (nightly Electron CLI), logseq-pm, tmux.
+#
+# Node.js / npm are inherited from the base image (NodeSource 22). Upstream's
+# Dockerfile.dev re-installs Node via nvm on top of that and symlinks it over
+# the base's copy; we skip that -- it costs ~150MB and three symlink hacks to
+# replace a Node that already works. Uncomment the nvm block below if you need
+# per-project Node version switching inside the sandbox.
+#
+# Claude Code, Codex CLI and their ACP adapters come from the base image.
+
+ARG BASE_IMAGE=ghcr.io/jbain/aoe-slim:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+# ---------------------------------------------------------------------------
+# GitHub CLI + tmux (unchanged from upstream Dockerfile.dev)
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y gh tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Continue as root (base image sets IS_SANDBOX=1)
+WORKDIR /root
+
+# ---------------------------------------------------------------------------
+# Rust -- disabled. Uncomment if a project needs cargo in the sandbox; it adds
+# roughly 1.5GB. `# [slim]` markers kept so this diffs cleanly against upstream.
+# ---------------------------------------------------------------------------
+# [slim] RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# [slim] ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# uv (Python)
+# ---------------------------------------------------------------------------
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# Go -- resolved to the current stable release for the build platform's arch.
+# Override GO_VERSION (e.g. "go1.25.1") to pin.
+# ---------------------------------------------------------------------------
+ARG GO_VERSION=stable
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) goarch=amd64 ;; \
+        arm64) goarch=arm64 ;; \
+        *) echo "unsupported architecture for Go: $arch" >&2; exit 1 ;; \
+    esac; \
+    if [ "$GO_VERSION" = "stable" ]; then \
+        version="$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors 'https://go.dev/VERSION?m=text' | head -n1)"; \
+    else \
+        version="$GO_VERSION"; \
+    fi; \
+    echo "installing ${version} for ${goarch}"; \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "https://go.dev/dl/${version}.linux-${goarch}.tar.gz" -o /tmp/go.tar.gz; \
+    rm -rf /usr/local/go; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    rm /tmp/go.tar.gz; \
+    /usr/local/go/bin/go version
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+ENV GOPATH="/root/go"
+
+# ---------------------------------------------------------------------------
+# Playwright + Chromium.
+#
+# `--with-deps` pulls in the system libraries Chromium needs; those same
+# libraries cover most of what the Electron-based logseq CLI below links
+# against, so this deliberately runs first.
+#
+# PLAYWRIGHT_BROWSERS_PATH is pinned to a system location rather than the
+# default /root/.cache/ms-playwright: aoe bind-mounts several /root
+# subdirectories per session, and a browser store under the home directory is
+# easy to shadow accidentally.
+# ---------------------------------------------------------------------------
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+# `playwright install chromium` lays down TWO browser builds: full Chromium
+# (393MB) and the "headless shell" (266MB). Both are kept, because a default
+# `chromium.launch()` resolves to the headless shell -- deleting it breaks the
+# common path with "Executable doesn't exist". Note that `chromium.executablePath()`
+# reports the FULL Chromium path even when the shell is what actually launches,
+# so that property is not a safe way to decide the shell is unused.
+#
+# Set PLAYWRIGHT_ONLY_SHELL=1 to install only the headless shell (saves ~393MB).
+# That is the officially supported slim mode, but it removes headed browsing:
+# `headless: false` and anything driving a visible browser under xvfb will fail.
+#
+# The npm cache purge must happen in THIS RUN: cleaning up in a later layer
+# leaves the bytes in the lower layer and grows the image instead of shrinking it.
+ARG PLAYWRIGHT_ONLY_SHELL=0
+RUN npm install -g playwright \
+    && if [ "$PLAYWRIGHT_ONLY_SHELL" = "1" ]; then \
+           playwright install --with-deps --only-shell chromium; \
+       else \
+           playwright install --with-deps chromium; \
+       fi \
+    && npm cache clean --force \
+    && rm -rf /root/.npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Globally-installed npm packages are not resolvable by `require()` from an
+# arbitrary cwd, so without this a script in /workspace can run the `playwright`
+# CLI but cannot `require("playwright")`.
+ENV NODE_PATH=/usr/lib/node_modules
+
+# ---------------------------------------------------------------------------
+# Caddy -- official release tarball rather than the Cloudsmith apt repo, to
+# avoid a third apt keyring in the image. Override CADDY_VERSION to pin.
+# ---------------------------------------------------------------------------
+ARG CADDY_VERSION=latest
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) caddyarch=amd64 ;; \
+        arm64) caddyarch=arm64 ;; \
+        *) echo "unsupported architecture for Caddy: $arch" >&2; exit 1 ;; \
+    esac; \
+    if [ "$CADDY_VERSION" = "latest" ]; then \
+        version="$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors https://api.github.com/repos/caddyserver/caddy/releases/latest \
+            | jq -r '.tag_name' | sed 's/^v//')"; \
+    else \
+        version="${CADDY_VERSION#v}"; \
+    fi; \
+    [ -n "$version" ] && [ "$version" != "null" ]; \
+    echo "installing caddy ${version} for ${caddyarch}"; \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "https://github.com/caddyserver/caddy/releases/download/v${version}/caddy_${version}_linux_${caddyarch}.tar.gz" \
+        -o /tmp/caddy.tar.gz; \
+    tar -C /usr/local/bin -xzf /tmp/caddy.tar.gz caddy; \
+    rm /tmp/caddy.tar.gz; \
+    chmod +x /usr/local/bin/caddy; \
+    caddy version
+
+# ---------------------------------------------------------------------------
+# logseq CLI.
+#
+# Logseq ships no standalone CLI binary; the CLI is a JS entrypoint inside the
+# desktop app's app.asar, invoked by running the bundled Electron in Node mode.
+# This mirrors the shim the macOS installer writes.
+#
+# Nightly asset names embed the version (e.g.
+# Logseq-linux-arm64-2.0.1-alpha+nightly.20260826.zip), so the download URL is
+# resolved from the releases API at build time instead of being pinned to a URL
+# that dies at the next nightly. Note the arch spelling differs between the two
+# assets: `linux-arm64` vs `linux-x86_64`.
+#
+# LOGSEQ_RELEASE selects the release tag ("nightly" or e.g. "0.10.9").
+# ---------------------------------------------------------------------------
+ARG LOGSEQ_RELEASE=nightly
+
+# Electron dynamically links GTK3 and friends at process start even in
+# ELECTRON_RUN_AS_NODE mode, so the CLI needs the desktop libraries despite
+# never opening a window. Playwright's Chromium deps above do not cover these:
+# Chromium's headless shell links a different (smaller) set.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0t64 \
+    libnotify4 \
+    libnss3 \
+    libxss1 \
+    libxtst6 \
+    libatk1.0-0t64 \
+    libatspi2.0-0t64 \
+    libasound2t64 \
+    libsecret-1-0 \
+    libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=secret,id=gh_token,required=false \
+    set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) lsarch=x86_64 ;; \
+        arm64) lsarch=arm64 ;; \
+        *) echo "unsupported architecture for logseq: $arch" >&2; exit 1 ;; \
+    esac; \
+    auth=""; \
+    if [ -r /run/secrets/gh_token ]; then \
+        auth="Authorization: Bearer $(cat /run/secrets/gh_token)"; \
+    fi; \
+    url="$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors ${auth:+-H "$auth"} \
+        "https://api.github.com/repos/logseq/logseq/releases/tags/${LOGSEQ_RELEASE}" \
+        | jq -r --arg a "linux-${lsarch}" \
+            '.assets[] | select(.name | test("Logseq-" + $a + "-.*\\.zip$")) | .browser_download_url' \
+        | head -n1)"; \
+    [ -n "$url" ] && [ "$url" != "null" ]; \
+    echo "downloading ${url}"; \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$url" -o /tmp/logseq.zip; \
+    rm -rf /opt/logseq; \
+    mkdir -p /opt/logseq; \
+    unzip -q /tmp/logseq.zip -d /opt/logseq; \
+    rm /tmp/logseq.zip; \
+    if [ ! -f /opt/logseq/resources/app.asar ]; then \
+        inner="$(find /opt/logseq -maxdepth 3 -name app.asar -path '*/resources/*' -print -quit)"; \
+        [ -n "$inner" ]; \
+        approot="$(dirname "$(dirname "$inner")")"; \
+        if [ "$approot" != "/opt/logseq" ]; then \
+            mv "$approot" /opt/logseq.app; \
+            rm -rf /opt/logseq; \
+            mv /opt/logseq.app /opt/logseq; \
+        fi; \
+    fi; \
+    bin="$(find /opt/logseq -maxdepth 1 -type f -name 'Logseq' -o -maxdepth 1 -type f -name 'logseq' | head -n1)"; \
+    [ -n "$bin" ]; \
+    chmod +x "$bin"; \
+    printf '%s\n' \
+        '#!/usr/bin/env sh' \
+        '# logseq-cli-managed' \
+        'set -eu' \
+        "ELECTRON_RUN_AS_NODE=1 exec \"$bin\" /opt/logseq/resources/app.asar/js/logseq-cli.js \"\$@\"" \
+        > /usr/local/bin/logseq; \
+    chmod +x /usr/local/bin/logseq; \
+    find /opt/logseq/locales -type f ! -name 'en-US.pak' -delete 2>/dev/null || true; \
+    rm -f /opt/logseq/LICENSES.chromium.html; \
+    logseq --version
+
+# ---------------------------------------------------------------------------
+# logseq-pm (jbain/logseq-project-management).
+#
+# The repo is private today and will be published later. While it is private,
+# the build needs a token with `repo` scope, supplied as a BuildKit secret:
+#
+#     docker build --secret id=gh_token,env=GH_TOKEN ...
+#
+# LOGSEQ_PM_OPTIONAL=1 (the default, for now) downgrades a failed install to a
+# warning so the image still builds without a token. Flip it to 0 -- and drop
+# this note -- once the repo is public.
+# ---------------------------------------------------------------------------
+ARG LOGSEQ_PM_REPO=github.com/jbain/logseq-project-management
+ARG LOGSEQ_PM_REF=main
+ARG LOGSEQ_PM_OPTIONAL=1
+RUN --mount=type=secret,id=gh_token,required=false \
+    set -eu; \
+    if [ -r /run/secrets/gh_token ]; then \
+        url="https://x-access-token:$(cat /run/secrets/gh_token)@${LOGSEQ_PM_REPO}.git"; \
+    else \
+        url="https://${LOGSEQ_PM_REPO}.git"; \
+    fi; \
+    if uv tool install --from "git+${url}@${LOGSEQ_PM_REF}" logseq-project-management; then \
+        logseq-pm --version; \
+    elif [ "$LOGSEQ_PM_OPTIONAL" = "1" ]; then \
+        echo "WARNING: logseq-pm not installed (repo private or unreachable, and LOGSEQ_PM_OPTIONAL=1)" >&2; \
+    else \
+        echo "ERROR: logseq-pm install failed" >&2; \
+        exit 1; \
+    fi
+
+# ---------------------------------------------------------------------------
+# nvm + pnpm -- disabled; the base image's NodeSource Node 22 is used instead.
+# ---------------------------------------------------------------------------
+# [slim] ENV NVM_DIR="/root/.nvm"
+# [slim] RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \
+# [slim]     && . "$NVM_DIR/nvm.sh" \
+# [slim]     && nvm install --lts \
+# [slim]     && nvm alias default node \
+# [slim]     && npm install -g pnpm \
+# [slim]     && ln -s "$(which node)" /root/.local/bin/node \
+# [slim]     && ln -s "$(which npm)" /root/.local/bin/npm \
+# [slim]     && ln -s "$(which npx)" /root/.local/bin/npx \
+# [slim]     && ln -s "$(which pnpm)" /root/.local/bin/pnpm
+
+# ---------------------------------------------------------------------------
+# Bun -- disabled.
+# ---------------------------------------------------------------------------
+# [slim] RUN apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/* \
+# [slim]     && curl -fsSL https://bun.sh/install | bash
+# [slim] ENV PATH="/root/.bun/bin:${PATH}"
+
+# Add dev tool paths to profile.d so they're available in all shells (login and non-login)
+RUN echo 'export PATH="/usr/local/go/bin:/root/go/bin:/root/.local/bin:$PATH"' > /etc/profile.d/dev-tools.sh \
+    && echo 'export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright' >> /etc/profile.d/dev-tools.sh \
+    && echo 'export NODE_PATH=/usr/lib/node_modules' >> /etc/profile.d/dev-tools.sh \
+    && echo 'export GOPATH="/root/go"' >> /etc/profile.d/dev-tools.sh \
+    && chmod +x /etc/profile.d/dev-tools.sh
+
+# Also set BASH_ENV so non-interactive bash shells source the paths
+ENV BASH_ENV=/etc/profile.d/dev-tools.sh
+
+WORKDIR /workspace

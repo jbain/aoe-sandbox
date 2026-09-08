@@ -1,0 +1,160 @@
+# Reusable: build one image for linux/amd64 + linux/arm64 and publish a
+# multi-arch manifest to GHCR.
+#
+# Each platform builds on a NATIVE runner and pushes an untagged, digest-only
+# image; a final job stitches the digests into one manifest list. This is the
+# pattern the Docker docs call "distribute the build across runners", and it
+# matters here: the dev image installs Chromium and an Electron bundle, both of
+# which are miserable to build for arm64 under QEMU emulation. See the
+# commented fallback in build-images.yaml if native arm runners are ever
+# unavailable to this repo.
+
+name: Build image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Fully-qualified image name, e.g. ghcr.io/jbain/aoe-slim
+        required: true
+        type: string
+      slug:
+        description: Short id for this image; namespaces the build cache and digest artifacts
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile
+        required: true
+        type: string
+      context:
+        description: Build context
+        required: false
+        type: string
+        default: ./docker
+      build-args:
+        description: Newline-separated build args
+        required: false
+        type: string
+        default: ''
+    secrets:
+      gh_token:
+        description: >-
+          Token exposed to the build as the BuildKit secret `gh_token`. Used for
+          GitHub API rate limits (logseq nightly asset lookup) and for cloning
+          the private logseq-pm repo. Optional.
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: ${{ inputs.slug }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          secrets: |
+            gh_token=${{ secrets.gh_token }}
+          # Digest-only push; the merge job below applies the real tags.
+          outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+          # Scope the cache per image AND per platform: a shared scope makes the
+          # two matrix legs evict each other's layers on every run.
+          cache-from: type=gha,scope=${{ inputs.slug }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.slug }}-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ inputs.slug }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: ${{ inputs.slug }} (manifest)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ inputs.slug }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=sha,format=short
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ inputs.image }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect \
+            "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
