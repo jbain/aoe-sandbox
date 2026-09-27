@@ -28,6 +28,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y gh tmux \
     && rm -rf /var/lib/apt/lists/*
 
+# gh's bash completion. Dropped into the same directory the base image's
+# /root/.bashrc already loops over (see docker/Dockerfile), so no .bashrc
+# changes are needed here.
+RUN gh completion -s bash > /etc/bash_completion.d/gh
+
 # Continue as root (base image sets IS_SANDBOX=1)
 WORKDIR /root
 
