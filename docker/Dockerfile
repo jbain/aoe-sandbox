@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fzf \
     unzip \
     vim \
+    net-tools \
     iputils-ping \
     iproute2 \
     dnsutils \
