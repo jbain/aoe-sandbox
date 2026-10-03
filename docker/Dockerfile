@@ -30,8 +30,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     fzf \
     unzip \
+    vim \
+    iputils-ping \
+    iproute2 \
+    dnsutils \
+    netcat-openbsd \
+    traceroute \
     zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# Use vim as the default editor, including for git (commit messages, rebase).
+ENV EDITOR=vim VISUAL=vim
+RUN git config --system core.editor vim
 
 # Install Node.js (required for Codex CLI)
 # [slim] Kept: Codex CLI and both ACP adapters below are npm packages, so Node
@@ -139,7 +149,7 @@ ENV PATH="/root/.local/bin:${PATH}"
 # [slim] (upstream also installed `pi-acp` here; dropped with the Pi CLI.)
 RUN npm install -g \
     @openai/codex \
-    @agentclientprotocol/claude-agent-acp@^0.55.0 \
+    @agentclientprotocol/claude-agent-acp@latest \
     @agentclientprotocol/codex-acp@latest \
     && find /usr/lib/node_modules -type f -size +1M -exec sha256sum {} + \
         | sort -k1,1 > /tmp/sums \
