@@ -24,16 +24,22 @@
 #   - /dev/fuse must be passed through to the sandbox container for
 #     fuse-overlayfs (storage.conf below) to mount.
 #
-# In short: this script alone is not sufficient inside a container that
-# was started without elevated privileges -- that has to be granted by
-# whatever launches the sandbox container (e.g. `--privileged`, or
-# `--cap-add SYS_ADMIN --device /dev/fuse` plus a subuid/subgid range for
-# root). Verified against podman 5.7.0 on Ubuntu 26.04: even with a correct
-# subuid range and fuse-overlayfs storage, `podman build` still failed on
-# every RUN step with "mount proc to proc: Operation not permitted" (or,
-# with crun, a fatal ping_group_range sysctl write against a read-only
-# /proc/sys) when the sandbox container itself only had the default
-# non-privileged capability set.
+# In short: in a default unprivileged sandbox, /proc/sys and /sys/fs/cgroup
+# are read-only by design, and crun fails when it tries to write to them
+# (ping_group_range sysctl, cgroup.subtree_control). Rather than make them
+# writable, this script avoids the writes: when /sys/fs/cgroup is not
+# writable it adds a drop-in (sandbox-restricted.conf below) that sets
+# `cgroups = "disabled"` and `netns = "host"`. With that, `podman build` and
+# `podman run` work (verified against podman 5.7.0, crun 1.21, Ubuntu 26.04
+# arm64), at these costs:
+#   - nested containers use host networking and have no cgroup resource
+#     limits.
+#   - nested containers share the sandbox's network namespace, so two of
+#     them cannot bind the same port.
+# In a `--privileged` sandbox the drop-in is skipped, so cgroup limits and
+# network isolation stay in place. Other requirements (CAP_SYS_ADMIN,
+# /dev/fuse, a subuid/subgid range for root) still have to be granted by
+# whatever launches the sandbox container.
 set -eu
 
 apt-get update
@@ -58,7 +64,27 @@ printf '%s\n' \
     'events_logger = "file"' \
     > /etc/containers/containers.conf.d/sandbox.conf
 
-echo "podman installed. If 'podman build'/'podman run' fail with mount or" >&2
-echo "namespace errors, the sandbox container needs to be started with" >&2
-echo "more privilege (CAP_SYS_ADMIN, /dev/fuse, a subuid/subgid range for" >&2
-echo "root) -- see the comment at the top of this script." >&2
+# Restricted sandbox: /sys/fs/cgroup (and /proc/sys) are read-only, so skip
+# the cgroup and netns setup that would write to them.
+restricted=false
+if [ ! -w /sys/fs/cgroup ]; then
+    restricted=true
+    printf '%s\n' \
+        '[containers]' \
+        'cgroups = "disabled"' \
+        'netns = "host"' \
+        > /etc/containers/containers.conf.d/sandbox-restricted.conf
+fi
+
+echo "podman installed." >&2
+if [ "$restricted" = true ]; then
+    echo "Restricted sandbox detected (/sys/fs/cgroup is read-only): wrote" >&2
+    echo "/etc/containers/containers.conf.d/sandbox-restricted.conf, so nested" >&2
+    echo "containers run with cgroups disabled (no resource limits) and host" >&2
+    echo "networking (they share this sandbox's network namespace, so two" >&2
+    echo "containers cannot bind the same port)." >&2
+fi
+echo "If 'podman build'/'podman run' fail with mount or namespace errors," >&2
+echo "the sandbox container needs to be started with more privilege" >&2
+echo "(CAP_SYS_ADMIN, /dev/fuse, a subuid/subgid range for root) -- see the" >&2
+echo "comment at the top of this script." >&2
